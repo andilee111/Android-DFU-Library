@@ -25,32 +25,38 @@ package no.nordicsemi.android.dfu;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.Build;
 import android.os.ParcelUuid;
 import android.os.Parcelable;
-import android.support.annotation.NonNull;
-import android.support.annotation.Nullable;
-import android.support.annotation.RequiresApi;
 
 import java.security.InvalidParameterException;
 import java.util.UUID;
+
+import androidx.annotation.IntRange;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.RawRes;
+import androidx.annotation.RequiresApi;
 
 /**
  * Starting the DfuService service requires a knowledge of some EXTRA_* constants used to pass
  * parameters to the service. The DfuServiceInitiator class may be used to make this process easier.
  * It provides simple API that covers all low lever operations.
  */
-@SuppressWarnings({"WeakerAccess", "unused"})
-public class DfuServiceInitiator {
+@SuppressWarnings({"WeakerAccess", "unused", "deprecation"})
+public final class DfuServiceInitiator {
 	public static final int DEFAULT_PRN_VALUE = 12;
+	public static final int DEFAULT_MBR_SIZE = 0x1000;
 
 	/** Constant used to narrow the scope of the update to system components (SD+BL) only. */
-	public static final int SCOPE_SYSTEM_COMPONENTS = 7578;
+	public static final int SCOPE_SYSTEM_COMPONENTS = 1;
 	/** Constant used to narrow the scope of the update to application only. */
-	public static final int SCOPE_APPLICATION = 3542;
+	public static final int SCOPE_APPLICATION = 2;
 
 	private final String deviceAddress;
 	private String deviceName;
@@ -72,12 +78,18 @@ public class DfuServiceInitiator {
 	private boolean keepBond;
 	private boolean restoreBond;
 	private boolean forceDfu = false;
+	private boolean forceScanningForNewAddressInLegacyDfu = false;
 	private boolean enableUnsafeExperimentalButtonlessDfu = false;
+	private boolean disableResume = false;
+	private int numberOfRetries = 0; // 0 to be backwards compatible
+	private int mbrSize = DEFAULT_MBR_SIZE;
+	private long dataObjectDelay = 0; // initially disabled
 
 	private Boolean packetReceiptNotificationsEnabled;
 	private int numberOfPackets = 12;
 
 	private int mtu = 517;
+	private int currentMtu = 23;
 
 	private Parcelable[] legacyDfuUuids;
 	private Parcelable[] secureDfuUuids;
@@ -89,6 +101,7 @@ public class DfuServiceInitiator {
 	 * Creates the builder. Use setZip(...), or setBinOrHex(...) methods to specify the file you
 	 * want to upload. In the latter case an init file may also be set using the setInitFile(...)
 	 * method. Init files are required by DFU Bootloader version 0.5 or newer (SDK 7.0.0+).
+	 *
 	 * @param deviceAddress the target device device address
 	 */
 	public DfuServiceInitiator(@NonNull final String deviceAddress) {
@@ -100,6 +113,7 @@ public class DfuServiceInitiator {
 	 * during the DFU process. If not set the
 	 * {@link no.nordicsemi.android.dfu.R.string#dfu_unknown_name R.string.dfu_unknown_name}
 	 * value will be used.
+	 *
 	 * @param name the device name (optional)
 	 * @return the builder
 	 */
@@ -111,6 +125,7 @@ public class DfuServiceInitiator {
 	/**
 	 * Sets whether the progress notification in the status bar should be disabled.
 	 * Defaults to false.
+	 *
 	 * @param disableNotification whether to disable the notification
 	 * @return the builder
 	 */
@@ -123,10 +138,11 @@ public class DfuServiceInitiator {
 	 * Sets whether the DFU service should be started as a foreground service. By default it's
 	 * <i>true</i>. According to
 	 * <a href="https://developer.android.com/about/versions/oreo/background.html">
-	 *     https://developer.android.com/about/versions/oreo/background.html</a>
+	 * https://developer.android.com/about/versions/oreo/background.html</a>
 	 * the background service may be killed by the system on Android Oreo after user quits the
 	 * application so it is recommended to keep it as a foreground service (default) at least on
 	 * Android Oreo+.
+	 *
 	 * @param foreground whether the service should be started in foreground state.
 	 * @return the builder
 	 */
@@ -137,13 +153,19 @@ public class DfuServiceInitiator {
 
 	/**
 	 * Sets whether the bond information should be preserver after flashing new application.
-	 * This feature requires DFU Bootloader version 0.6 or newer (SDK 8.0.0+).
+	 * This feature requires Legacy DFU Bootloader version 0.6 or newer (SDK 8.0.0+).
 	 * Please see the {@link DfuBaseService#EXTRA_KEEP_BOND} for more information regarding
-	 * requirements. Remember that currently updating the Soft Device will remove the bond
-	 * information.
+	 * requirements.
 	 * <p>
 	 * This flag is ignored when Secure DFU Buttonless Service is used. It will keep or remove the
 	 * bond depending on the Buttonless service type.
+	 * <p>
+	 * <b>Important:</b> The flag does not ensure that the DFU is performed on an encrypted link.
+	 * If the bond information is present only on Android side, but not on the peripheral side,
+	 * Android (version 4.3-10) will connect without encryption. On those versions it is not possible
+	 * to ensure the link is truly encrypted, as {@link BluetoothDevice#getBondState()} returns
+	 * {@link BluetoothDevice#BOND_BONDED} also if bonding isn't used.
+	 *
 	 * @param keepBond whether the bond information should be preserved in the new application.
 	 * @return the builder
 	 */
@@ -153,12 +175,14 @@ public class DfuServiceInitiator {
 	}
 
 	/**
-	 * Sets whether the bond should be created after the DFU is complete.
+	 * Sets whether a new bond should be created after the DFU is complete. The old bond
+	 * information will be removed before.
 	 * Please see the {@link DfuBaseService#EXTRA_RESTORE_BOND} for more information regarding
 	 * requirements.
 	 * <p>
 	 * This flag is ignored when Secure DFU Buttonless Service is used. It will keep or will not
 	 * restore the bond depending on the Buttonless service type.
+	 *
 	 * @param restoreBond whether the bond should be created after the DFU is complete.
 	 * @return the builder
 	 */
@@ -168,10 +192,35 @@ public class DfuServiceInitiator {
 	}
 
 	/**
+	 * This method sets the duration of a delay, that the service will wait before sending each
+	 * data object in Secure DFU. The delay will be done after a data object is created, and before
+	 * any data byte is sent. The default value is 0, which disables this feature.
+	 * <p>
+	 * It has been found, that a delay of at least 300ms reduces the risk of packet lose (the
+	 * bootloader needs some time to prepare flash memory) on DFU bootloader from SDK 15 and 16.
+	 * The delay does not have to be longer than 400 ms, as according to performed tests, such delay
+	 * is sufficient.
+	 * <p>
+	 * The longer the delay, the more time DFU will take to complete (delay will be repeated for
+	 * each data object (4096 bytes)). However, with too small delay a packet lose may occur,
+	 * causing the service to enable PRN and set them to 1 making DFU process very, very slow
+	 * (but reliable).
+	 *
+	 * @param delay the initial delay that the service will wait before sending each data object.
+	 * @since 1.10
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setPrepareDataObjectDelay(final long delay) {
+		this.dataObjectDelay = delay;
+		return this;
+	}
+
+	/**
 	 * Enables or disables the Packet Receipt Notification (PRN) procedure.
 	 * <p>
 	 * By default the PRNs are disabled on devices with Android Marshmallow or newer and enabled on
 	 * older ones.
+	 *
 	 * @param enabled true to enabled PRNs, false to disable
 	 * @return the builder
 	 * @see DfuSettingsConstants#SETTINGS_PACKET_RECEIPT_NOTIFICATION_ENABLED
@@ -184,12 +233,17 @@ public class DfuServiceInitiator {
 	/**
 	 * If Packet Receipt Notification procedure is enabled, this method sets number of packets to
 	 * be sent before receiving a PRN. A PRN is used to synchronize the transmitter and receiver.
+	 * <p>
+	 * If the value given is equal to 0, the {@link #DEFAULT_PRN_VALUE} will be used instead.
+	 * <p>
+	 * To disable PRNs use {@link #setPacketsReceiptNotificationsEnabled(boolean)}.
+	 *
 	 * @param number number of packets to be sent before receiving a PRN. Defaulted when set to 0.
 	 * @return the builder
 	 * @see #setPacketsReceiptNotificationsEnabled(boolean)
 	 * @see DfuSettingsConstants#SETTINGS_NUMBER_OF_PACKETS
 	 */
-	public DfuServiceInitiator setPacketsReceiptNotificationsValue(final int number) {
+	public DfuServiceInitiator setPacketsReceiptNotificationsValue(@IntRange(from = 0) final int number) {
 		this.numberOfPackets = number > 0 ? number : DEFAULT_PRN_VALUE;
 		return this;
 	}
@@ -220,6 +274,7 @@ public class DfuServiceInitiator {
 	 * method with parameter equal to true.
 	 * <p>
 	 * This method is ignored in Secure DFU.
+	 *
 	 * @param force true to ensure the DFU will start if there is no DFU Version characteristic
 	 *              (Legacy DFU only)
 	 * @return the builder
@@ -228,6 +283,69 @@ public class DfuServiceInitiator {
 	@SuppressWarnings("JavaDoc")
 	public DfuServiceInitiator setForceDfu(final boolean force) {
 		this.forceDfu = force;
+		return this;
+	}
+
+	/**
+	 * When this is set to true, the Legacy Buttonless Service will scan for the device advertising
+	 * with an incremented MAC address, instead of trying to reconnect to the same device.
+	 * <p>
+	 * Setting this to true requires modifying the buttonless service on the device not to share the
+	 * peer data with the bootloader, or modifying the bootloader to always advertise with MAC+1.
+	 * Setting it to true with a default implementation of the buttonless service should work, but
+	 * is pointless.
+	 * <p>
+	 * This is a feature equivalent to
+	 * <a href="https://github.com/NordicSemiconductor/IOS-Pods-DFU-Library/pull/374">PR #374</a>
+	 * in DFU library for iOS.
+	 * @param force set to true when your bootloader is advertising with an incremented MAC address.
+	 *              By default, in Legacy DFU, the bootloader uses the same MAC address and is
+	 *              advertising directly. This does not seen to work on some phones (Samsung) with
+	 *              recent Android versions.
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setForceScanningForNewAddressInLegacyDfu(final boolean force) {
+		this.forceScanningForNewAddressInLegacyDfu = force;
+		return this;
+	}
+
+	/**
+	 * This options allows to disable the resume feature in Secure DFU. When the extra value is set
+	 * to true, the DFU will send Init Packet and Data again, despite the firmware might have been
+	 * send partially before. By default, without setting this extra, or by setting it to false,
+	 * the DFU will resume the previously cancelled upload if CRC values match.
+	 * <p>
+	 * It is ignored when Legacy DFU is used.
+	 * <p>
+	 * This feature seems to help in some cases:
+	 * <a href="https://github.com/NordicSemiconductor/Android-DFU-Library/issues/71">#71</a>.
+	 *
+	 * @return the builder
+	 */
+	public DfuServiceInitiator disableResume() {
+		this.disableResume = true;
+		return this;
+	}
+
+	/**
+	 * Sets the number of retries that the DFU service will use to complete DFU. The default
+	 * value is 0, for backwards compatibility reason.
+	 * <p>
+	 * If the given value is greater than 0, the service will restart itself at most {@code max}
+	 * times in case of an undesired disconnection during DFU operation. This attempt counter
+	 * is independent from another counter, for reconnection attempts, which is equal to 3.
+	 * The latter one will be used when connection will fail with an error (possible packet
+	 * collision or any other reason). After successful connection, the reconnection counter is
+	 * reset, while the retry counter is cleared after a DFU finishes with success.
+	 * <p>
+	 * The service will not try to retry DFU in case of any other error, for instance an error
+	 * sent from the target device.
+	 *
+	 * @param max Maximum number of retires to complete DFU. Usually around 2.
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setNumberOfRetries(@IntRange(from = 0) final int max) {
+		this.numberOfRetries = max;
 		return this;
 	}
 
@@ -251,13 +369,36 @@ public class DfuServiceInitiator {
 	 * @param mtu the MTU that wil be requested, 0 to disable MTU request.
 	 * @return the builder
 	 */
-	public DfuServiceInitiator setMtu(final int mtu) {
+	public DfuServiceInitiator setMtu(@IntRange(from = 23, to = 517) final int mtu) {
 		this.mtu = mtu;
 		return this;
 	}
 
 	/**
+	 * Sets the current MTU value. This method should be used only if the device is already
+	 * connected and MTU has been requested before DFU service is started.
+	 * The SoftDevice allows to change MTU only once, while the following requests fail with
+	 * Invalid PDU error. In case this error is received, the MTU will be set to the value
+	 * specified using this method. There is no verification of this value. If it's set to
+	 * too high value, some of the packets will not be sent and DFU will not succeed.
+	 * <p>
+	 * By default value 23 is used for compatibility reasons.
+	 * <p>
+	 * Higher MTU values were supported since SDK 15.0.
+	 *
+	 * @param mtu the MTU value received in
+	 *            {@link android.bluetooth.BluetoothGattCallback#onMtuChanged(BluetoothGatt, int, int)} or
+	 *            {@link android.bluetooth.BluetoothGattServerCallback#onMtuChanged(BluetoothDevice, int)}.
+	 * @return the builder
+	 */
+	public DfuServiceInitiator setCurrentMtu(@IntRange(from = 23, to = 517) final int mtu) {
+		this.currentMtu = mtu;
+		return this;
+	}
+
+	/**
 	 * Disables MTU request.
+	 *
 	 * @return the builder
 	 * @see #setMtu(int)
 	 */
@@ -272,18 +413,47 @@ public class DfuServiceInitiator {
 	 * include the Softdevice and/or the Bootloader (they can't be separated as they are packed in
 	 * a single bin file and the library does not know whether it contains only the softdevice,
 	 * the bootloader or both) Application scope includes the application only.
+	 *
 	 * @param scope the update scope, one of {@link #SCOPE_SYSTEM_COMPONENTS} or
 	 *              {@link #SCOPE_APPLICATION}.
 	 * @return the builder
 	 */
-	public DfuServiceInitiator setScope(final int scope) {
+	public DfuServiceInitiator setScope(@DfuScope final int scope) {
 		if (!DfuBaseService.MIME_TYPE_ZIP.equals(mimeType))
 			throw new UnsupportedOperationException("Scope can be set only for a ZIP file");
 		if (scope == SCOPE_APPLICATION)
 			fileType = DfuBaseService.TYPE_APPLICATION;
 		else if (scope == SCOPE_SYSTEM_COMPONENTS)
 			fileType = DfuBaseService.TYPE_SOFT_DEVICE | DfuBaseService.TYPE_BOOTLOADER;
+		else if (scope == (SCOPE_APPLICATION | SCOPE_SYSTEM_COMPONENTS))
+			fileType = DfuBaseService.TYPE_AUTO;
 		else throw new UnsupportedOperationException("Unknown scope");
+		return this;
+	}
+
+	/**
+	 * This method sets the size of an MBR (Master Boot Record). It should be used only
+	 * when updating a file from a HEX file. If you use BIN or ZIP, value set here will
+	 * be ignored.
+	 * <p>
+	 * The MBR size is important for the HEX parser, which has to cut it from the Soft Device's
+	 * HEX before sending it to the DFU target. The MBR can't be updated using DFU, and the
+	 * bootloader expects only the Soft Device bytes. Usually, the Soft Device HEX provided
+	 * by Nordic contains an MBR at addresses 0x0000 to 0x1000.
+	 * 0x1000 is the default size of MBR which will be used.
+	 * <p>
+	 * If you have a HEX file which address start from 0 and want to send the whole BIN content
+	 * from it, you have to set the MBR size to 0, otherwise first 4096 bytes will be cut off.
+	 * <p>
+	 * The value set here will not be used if the {@link DfuSettingsConstants#SETTINGS_MBR_SIZE}
+	 * is set in Shared Preferences.
+	 *
+	 * @param mbrSize the MBR size in bytes. Defaults to 4096 (0x1000) bytes.
+	 * @return the builder
+	 * @see DfuSettingsConstants#SETTINGS_MBR_SIZE
+	 */
+	public DfuServiceInitiator setMbrSize(@IntRange(from = 0) final int mbrSize) {
+		this.mbrSize = mbrSize;
 		return this;
 	}
 
@@ -314,9 +484,11 @@ public class DfuServiceInitiator {
 	 * 0x01 - Success<br>
 	 * The device should disconnect and restart in DFU mode after sending the notification.
 	 * <p>
-	 * In SDK 13 this issue will be fixed by a proper implementation (bonding required,
-	 * passing bond information to the bootloader, encryption, well tested). It is recommended
-	 * to use this new service when SDK 13 (or later) is out. TODO fix the docs when SDK 13 is out.
+	 * The Buttonless service has changed in SDK 13 and later. Indications are used instead of
+	 * notifications. Also, Buttonless service for bonded devices has been added.
+	 * It is recommended to use any of the new services instead.
+	 *
+	 * @return the builder
 	 */
 	public DfuServiceInitiator setUnsafeExperimentalButtonlessServiceInSecureDfuEnabled(final boolean enable) {
 		this.enableUnsafeExperimentalButtonlessDfu = enable;
@@ -327,13 +499,14 @@ public class DfuServiceInitiator {
 	 * Sets custom UUIDs for Legacy DFU and Legacy Buttonless DFU. Use this method if your DFU
 	 * implementation uses different UUID for at least one of the given UUIDs.
 	 * Parameter set to <code>null</code> will reset the UUID to the default value.
-	 * @param dfuServiceUuid custom Legacy DFU service UUID or null, if default is to be used
+	 *
+	 * @param dfuServiceUuid      custom Legacy DFU service UUID or null, if default is to be used
 	 * @param dfuControlPointUuid custom Legacy DFU Control Point characteristic UUID or null,
 	 *                            if default is to be used
-	 * @param dfuPacketUuid custom Legacy DFU Packet characteristic UUID or null, if default is
-	 *                      to be used
-	 * @param dfuVersionUuid custom Legacy DFU Version characteristic UUID or null,
-	 *                       if default is to be used (SDK 7.0 - 11.0 only, set null for earlier SDKs)
+	 * @param dfuPacketUuid       custom Legacy DFU Packet characteristic UUID or null, if default is
+	 *                            to be used
+	 * @param dfuVersionUuid      custom Legacy DFU Version characteristic UUID or null,
+	 *                            if default is to be used (SDK 7.0 - 11.0 only, set null for earlier SDKs)
 	 * @return the builder
 	 */
 	public DfuServiceInitiator setCustomUuidsForLegacyDfu(@Nullable final UUID dfuServiceUuid,
@@ -353,11 +526,12 @@ public class DfuServiceInitiator {
 	 * Sets custom UUIDs for Secure DFU. Use this method if your DFU implementation uses different
 	 * UUID for at least one of the given UUIDs. Parameter set to <code>null</code> will reset
 	 * the UUID to the default value.
-	 * @param dfuServiceUuid custom Secure DFU service UUID or null, if default is to be used
+	 *
+	 * @param dfuServiceUuid      custom Secure DFU service UUID or null, if default is to be used
 	 * @param dfuControlPointUuid custom Secure DFU Control Point characteristic UUID or null,
 	 *                            if default is to be used
-	 * @param dfuPacketUuid custom Secure DFU Packet characteristic UUID or null, if default is to
-	 *                      be used
+	 * @param dfuPacketUuid       custom Secure DFU Packet characteristic UUID or null, if default
+	 *                            is to be used
 	 * @return the builder
 	 */
 	public DfuServiceInitiator setCustomUuidsForSecureDfu(@Nullable final UUID dfuServiceUuid,
@@ -378,8 +552,9 @@ public class DfuServiceInitiator {
 	 * <p>
 	 * Remember to call {@link #setUnsafeExperimentalButtonlessServiceInSecureDfuEnabled(boolean)}
 	 * with parameter <code>true</code> if you intent to use this service.
-	 * @param buttonlessDfuServiceUuid custom Buttonless DFU service UUID or null, if default is to
-	 *                                 be used
+	 *
+	 * @param buttonlessDfuServiceUuid      custom Buttonless DFU service UUID or null, if default
+	 *                                      is to be used
 	 * @param buttonlessDfuControlPointUuid custom Buttonless DFU characteristic UUID or null,
 	 *                                      if default is to be used
 	 * @return the builder
@@ -397,8 +572,9 @@ public class DfuServiceInitiator {
 	 * Sets custom UUIDs for the Buttonless DFU Service from SDK 14 (or later).
 	 * Use this method if your DFU implementation uses different UUID for at least one of the given
 	 * UUIDs. Parameter set to <code>null</code> will reset the UUID to the default value.
-	 * @param buttonlessDfuServiceUuid custom Buttonless DFU service UUID or null, if default is to
-	 *                                 be used
+	 *
+	 * @param buttonlessDfuServiceUuid      custom Buttonless DFU service UUID or null, if default
+	 *                                      is to be used
 	 * @param buttonlessDfuControlPointUuid custom Buttonless DFU characteristic UUID or null,
 	 *                                      if default is to be used
 	 * @return the builder
@@ -416,8 +592,9 @@ public class DfuServiceInitiator {
 	 * Sets custom UUIDs for the Buttonless DFU Service from SDK 13. Use this method if your DFU
 	 * implementation uses different UUID for at least one of the given UUIDs.
 	 * Parameter set to <code>null</code> will reset the UUID to the default value.
-	 * @param buttonlessDfuServiceUuid custom Buttonless DFU service UUID or null, if default is to
-	 *                                 be used
+	 *
+	 * @param buttonlessDfuServiceUuid      custom Buttonless DFU service UUID or null, if default
+	 *                                      is to be used
 	 * @param buttonlessDfuControlPointUuid custom Buttonless DFU characteristic UUID or null,
 	 *                                      if default is to be used
 	 * @return the builder
@@ -434,6 +611,7 @@ public class DfuServiceInitiator {
 	/**
 	 * Sets the URI to the Distribution packet (ZIP) or to a ZIP file matching the deprecated naming
 	 * convention.
+	 *
 	 * @param uri the URI of the file
 	 * @return the builder
 	 * @see #setZip(String)
@@ -446,6 +624,7 @@ public class DfuServiceInitiator {
 	/**
 	 * Sets the path to the Distribution packet (ZIP) or the a ZIP file matching the deprecated naming
 	 * convention.
+	 *
 	 * @param path path to the file
 	 * @return the builder
 	 * @see #setZip(Uri)
@@ -458,12 +637,13 @@ public class DfuServiceInitiator {
 	/**
 	 * Sets the resource ID of the Distribution packet (ZIP) or the a ZIP file matching the
 	 * deprecated naming convention. The file should be in the /res/raw folder.
+	 *
 	 * @param rawResId file's resource ID
 	 * @return the builder
 	 * @see #setZip(Uri)
 	 * @see #setZip(String)
 	 */
-	public DfuServiceInitiator setZip(final int rawResId) {
+	public DfuServiceInitiator setZip(@RawRes final int rawResId) {
 		return init(null, null, rawResId, DfuBaseService.TYPE_AUTO, DfuBaseService.MIME_TYPE_ZIP);
 	}
 
@@ -471,7 +651,8 @@ public class DfuServiceInitiator {
 	 * Sets the URI or path of the ZIP file.
 	 * At least one of the parameters must not be null.
 	 * If the URI and path are not null the URI will be used.
-	 * @param uri the URI of the file
+	 *
+	 * @param uri  the URI of the file
 	 * @param path the path of the file
 	 * @return the builder
 	 */
@@ -483,17 +664,18 @@ public class DfuServiceInitiator {
 	 * Sets the URI of the BIN or HEX file containing the new firmware.
 	 * For DFU Bootloader version 0.5 or newer the init file must be specified using one of
 	 * {@link #setInitFile(Uri)} methods.
+	 *
 	 * @param fileType the file type, a bit field created from:
-	 *  	<ul>
-	 * 		    <li>{@link DfuBaseService#TYPE_APPLICATION} - the Application will be sent</li>
-	 * 		    <li>{@link DfuBaseService#TYPE_SOFT_DEVICE} - he Soft Device will be sent</li>
-	 * 		    <li>{@link DfuBaseService#TYPE_BOOTLOADER} - the Bootloader will be sent</li>
-	 * 		</ul>
-	 * @param uri the URI of the file
+	 *                 <ul>
+	 *                 <li>{@link DfuBaseService#TYPE_APPLICATION} - the Application will be sent</li>
+	 *                 <li>{@link DfuBaseService#TYPE_SOFT_DEVICE} - he Soft Device will be sent</li>
+	 *                 <li>{@link DfuBaseService#TYPE_BOOTLOADER} - the Bootloader will be sent</li>
+	 *                 </ul>
+	 * @param uri      the URI of the file
 	 * @return the builder
 	 */
 	@Deprecated
-	public DfuServiceInitiator setBinOrHex(final int fileType, @NonNull final Uri uri) {
+	public DfuServiceInitiator setBinOrHex(@FileType final int fileType, @NonNull final Uri uri) {
 		if (fileType == DfuBaseService.TYPE_AUTO)
 			throw new UnsupportedOperationException("You must specify the file type");
 		return init(uri, null, 0, fileType, DfuBaseService.MIME_TYPE_OCTET_STREAM);
@@ -503,12 +685,13 @@ public class DfuServiceInitiator {
 	 * Sets the URI of the BIN or HEX file containing the new firmware.
 	 * For DFU Bootloader version 0.5 or newer the init file must be specified using one of
 	 * {@link #setInitFile(String)} methods.
+	 *
 	 * @param fileType see {@link #setBinOrHex(int, Uri)} for details
-	 * @param path path to the file
+	 * @param path     path to the file
 	 * @return the builder
 	 */
 	@Deprecated
-	public DfuServiceInitiator setBinOrHex(final int fileType, @NonNull final String path) {
+	public DfuServiceInitiator setBinOrHex(@FileType final int fileType, @NonNull final String path) {
 		if (fileType == DfuBaseService.TYPE_AUTO)
 			throw new UnsupportedOperationException("You must specify the file type");
 		return init(null, path, 0, fileType, DfuBaseService.MIME_TYPE_OCTET_STREAM);
@@ -518,14 +701,15 @@ public class DfuServiceInitiator {
 	 * Sets the URI or path to the BIN or HEX file containing the new firmware.
 	 * For DFU Bootloader version 0.5 or newer the init file must be specified using one of
 	 * {@link #setInitFile(String)} methods.
+	 *
 	 * @param fileType see {@link #setBinOrHex(int, Uri)} for details
-	 * @param uri the URI of the file
-	 * @param path path to the file
+	 * @param uri      the URI of the file
+	 * @param path     path to the file
 	 * @return the builder
 	 * @deprecated The Distribution packet (ZIP) should be used for DFU Bootloader version 0.5 or newer
 	 */
 	@Deprecated
-	public DfuServiceInitiator setBinOrHex(final int fileType, @Nullable final Uri uri, @Nullable final String path) {
+	public DfuServiceInitiator setBinOrHex(@FileType final int fileType, @Nullable final Uri uri, @Nullable final String path) {
 		if (fileType == DfuBaseService.TYPE_AUTO)
 			throw new UnsupportedOperationException("You must specify the file type");
 		return init(uri, path, 0, fileType, DfuBaseService.MIME_TYPE_OCTET_STREAM);
@@ -535,12 +719,13 @@ public class DfuServiceInitiator {
 	 * Sets the resource ID pointing the BIN or HEX file containing the new firmware.
 	 * The file should be in the /res/raw folder. For DFU Bootloader version 0.5 or newer the init
 	 * file must be specified using one of {@link #setInitFile(int)} methods.
+	 *
 	 * @param fileType see {@link #setBinOrHex(int, Uri)} for details
 	 * @param rawResId resource ID
 	 * @return the builder
 	 */
 	@Deprecated
-	public DfuServiceInitiator setBinOrHex(final int fileType, final int rawResId) {
+	public DfuServiceInitiator setBinOrHex(@FileType final int fileType, @RawRes final int rawResId) {
 		if (fileType == DfuBaseService.TYPE_AUTO)
 			throw new UnsupportedOperationException("You must specify the file type");
 		return init(null, null, rawResId, fileType, DfuBaseService.MIME_TYPE_OCTET_STREAM);
@@ -550,6 +735,7 @@ public class DfuServiceInitiator {
 	 * Sets the URI of the Init file. The init file for DFU Bootloader version pre-0.5
 	 * (SDK 4.3, 6.0, 6.1) contains only the CRC-16 of the firmware.
 	 * Bootloader version 0.5 or newer requires the Extended Init Packet.
+	 *
 	 * @param initFileUri the URI of the init file
 	 * @return the builder
 	 */
@@ -562,6 +748,7 @@ public class DfuServiceInitiator {
 	 * Sets the path to the Init file. The init file for DFU Bootloader version pre-0.5
 	 * (SDK 4.3, 6.0, 6.1) contains only the CRC-16 of the firmware.
 	 * Bootloader version 0.5 or newer requires the Extended Init Packet.
+	 *
 	 * @param initFilePath the path to the init file
 	 * @return the builder
 	 */
@@ -574,11 +761,12 @@ public class DfuServiceInitiator {
 	 * Sets the resource ID of the Init file. The init file for DFU Bootloader version pre-0.5
 	 * (SDK 4.3, 6.0, 6.1) contains only the CRC-16 of the firmware.
 	 * Bootloader version 0.5 or newer requires the Extended Init Packet.
+	 *
 	 * @param initFileResId the resource ID of the init file
 	 * @return the builder
 	 */
 	@Deprecated
-	public DfuServiceInitiator setInitFile(final int initFileResId) {
+	public DfuServiceInitiator setInitFile(@RawRes final int initFileResId) {
 		return init(null, null, initFileResId);
 	}
 
@@ -586,7 +774,8 @@ public class DfuServiceInitiator {
 	 * Sets the URI or path to the Init file. The init file for DFU Bootloader version pre-0.5
 	 * (SDK 4.3, 6.0, 6.1) contains only the CRC-16 of the firmware. Bootloader version 0.5 or newer
 	 * requires the Extended Init Packet. If the URI and path are not null the URI will be used.
-	 * @param initFileUri the URI of the init file
+	 *
+	 * @param initFileUri  the URI of the init file
 	 * @param initFilePath the path of the init file
 	 * @return the builder
 	 */
@@ -597,6 +786,7 @@ public class DfuServiceInitiator {
 
 	/**
 	 * Starts the DFU service.
+	 *
 	 * @param context the application context
 	 * @param service the class derived from the BaseDfuService
 	 */
@@ -621,9 +811,16 @@ public class DfuServiceInitiator {
 		intent.putExtra(DfuBaseService.EXTRA_KEEP_BOND, keepBond);
 		intent.putExtra(DfuBaseService.EXTRA_RESTORE_BOND, restoreBond);
 		intent.putExtra(DfuBaseService.EXTRA_FORCE_DFU, forceDfu);
+		intent.putExtra(DfuBaseService.EXTRA_FORCE_SCANNING_FOR_BOOTLOADER_IN_LEGACY_DFU, forceScanningForNewAddressInLegacyDfu);
+		intent.putExtra(DfuBaseService.EXTRA_DISABLE_RESUME, disableResume);
+		intent.putExtra(DfuBaseService.EXTRA_MAX_DFU_ATTEMPTS, numberOfRetries);
+		intent.putExtra(DfuBaseService.EXTRA_MBR_SIZE, mbrSize);
+		intent.putExtra(DfuBaseService.EXTRA_DATA_OBJECT_DELAY, dataObjectDelay);
 		if (mtu > 0)
 			intent.putExtra(DfuBaseService.EXTRA_MTU, mtu);
+		intent.putExtra(DfuBaseService.EXTRA_CURRENT_MTU, currentMtu);
 		intent.putExtra(DfuBaseService.EXTRA_UNSAFE_EXPERIMENTAL_BUTTONLESS_DFU, enableUnsafeExperimentalButtonlessDfu);
+		//noinspection StatementWithEmptyBody
 		if (packetReceiptNotificationsEnabled != null) {
 			intent.putExtra(DfuBaseService.EXTRA_PACKET_RECEIPT_NOTIFICATIONS_ENABLED, packetReceiptNotificationsEnabled);
 			intent.putExtra(DfuBaseService.EXTRA_PACKET_RECEIPT_NOTIFICATIONS_VALUE, numberOfPackets);
@@ -656,7 +853,7 @@ public class DfuServiceInitiator {
 
 	private DfuServiceInitiator init(@Nullable final Uri initFileUri,
 									 @Nullable final String initFilePath,
-									 final int initFileResId) {
+									 @RawRes final int initFileResId) {
 		if (DfuBaseService.MIME_TYPE_ZIP.equals(mimeType))
 			throw new InvalidParameterException("Init file must be located inside the ZIP");
 
@@ -668,7 +865,7 @@ public class DfuServiceInitiator {
 
 	private DfuServiceInitiator init(@Nullable final Uri fileUri,
 									 @Nullable final String filePath,
-									 final int fileResId, final int fileType,
+									 @RawRes final int fileResId, @FileType final int fileType,
 									 @NonNull final String mimeType) {
 		this.fileUri = fileUri;
 		this.filePath = filePath;
@@ -695,6 +892,8 @@ public class DfuServiceInitiator {
 
 		final NotificationManager notificationManager =
 				(NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
-		notificationManager.createNotificationChannel(channel);
+		if (notificationManager != null) {
+			notificationManager.createNotificationChannel(channel);
+		}
 	}
 }
